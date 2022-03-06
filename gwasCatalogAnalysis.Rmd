@@ -1,0 +1,733 @@
+---
+title: "GWAS catalog analysis"
+output: html_notebook
+---
+
+Code and documentation for Annual Reviews Biomedical Data Science
+Data files located in in Box folder hosted by University of Pennsylvania:
+https://upenn.box.com/s/t80ztbbv5ly27fpmh3yhutr0x955i2p3
+===============================================================================
+
+GWAS catalog curation based on https://www.ebi.ac.uk/gwas/docs/file-downloads.
+Downloaded 'All studies v1.0.3 - with added fields to match unpublished downloads'
+and 'All ancestry data v1.0.3 - with added fields to match unpublished downloads'
+Downloaded on 8.7.2021.
+```{r}
+studies_path <- 'gwas-catalog-v1.0.3-studies-r2021-07-08.tsv'
+studies.df <- read.delim(studies_path, as.is=T)
+
+# There are two phenotype columns(disease trait and mapped trait)
+disease.trait.df <- data.frame(table(studies.df$DISEASE.TRAIT))
+# There are 49 rows with Height as phenotype
+mapped.trait.df <- data.frame(table(studies.df$MAPPED_TRAIT))
+# There are 51 rows with Body Height as phenotype
+
+# What are the extra rows with mapped trait column?
+height_disease_rows <- which(studies.df$DISEASE.TRAIT=='Height')
+height_mapped_rows <- which(studies.df$MAPPED_TRAIT=='body height')
+# Unique to mapped column
+which(!(height_mapped_rows %in% height_disease_rows))
+# Unique to disease column
+add_row <- which(!(height_disease_rows %in% height_mapped_rows))
+height_rows <- c(height_mapped_rows, add_row)
+# Subset height studies for manual inspection
+height.df <- studies.df[height_rows, ]
+# Export table with all columns minus the empty ones
+write.table(height.df[ , 1:16], file='height_studies.tsv', 
+            sep = '\t', row.names=F, quote=F)
+# There are 46 unique height studies
+length(unique(height.df$PUBMED.ID))
+```
+
+Merge ancestries and studies files to get ancestry by trait level data. For the
+most common phenotypes, find the biggest studies for major ancestry group.
+
+For phenotypes, use mapped trait column rather than the disease because it has
+4134 phenotypes vs disease trait with 13611, so it tends to combine traits
+into a category which is probably preferable. 
+```{r}
+ancestries_path <- 'gwas-catalog-v1.0.3-ancestries-r2021-07-08.tsv'
+anc.df <- read.delim(ancestries_path, as.is=T)
+studies_path <- 'gwas-catalog-v1.0.3-studies-r2021-07-08.tsv'
+studies.df <- read.delim(studies_path, as.is=T)
+
+# Remove empty columns
+anc.df <- anc.df[ , 1:12]
+studies.df <- studies.df[ , 1:16]
+merge.df <- merge(anc.df, studies.df, by='STUDY.ACCESSION')
+
+# Disease vs trait column
+disease_trait <- table(merge.df$DISEASE.TRAIT)
+disease.trait.df <- data.frame(disease_trait)
+mapped_trait <- table(merge.df$MAPPED_TRAIT)
+mapped.trait.df <- data.frame(mapped_trait)
+# make table for all mapped traits
+write.table(mapped.trait.df,
+            file='trait_count.txt',
+            quote=F, row.names=F)
+# Use mapped trait column because it has less categories
+# Keep traits with at least 50 "studies"
+trait_keep <- as.character(mapped.trait.df$Var1[mapped.trait.df$Freq>49])
+# Write table with studies for these traits
+trait.keep.df <- merge.df[merge.df$MAPPED_TRAIT %in% trait_keep, ]
+write.table(trait.keep.df, 
+            file='gwas_catalog_ancestry.tsv',
+            quote=F, row.names = F, sep = '\t')
+
+# Selecting the phenotypes shown in Figure 4 are based on having the largest
+# number of studies, specificity with regard to the phenotype, disease 
+# relevance
+mapped.trait.df$Var1[order(mapped.trait.df$Freq, decreasing = T)][1:30]
+# We chose T2D (9), BMI (10), AD (14), systolic blood pressure (16), asthma (18), 
+# schizophrenia (21), CAD (27)
+```
+
+ACCOUNTING FOR RESAMPLING IN HEIGHT GWAS 
+
+We manually kept track of the sample sizes for various ancestry groups across
+height studies, specifying down to the particular cohort if possible, except
+for the GIANT and PAGE consortia. Use the spreadsheet with blanks filled in with
+0 as that is most up to date. 
+
+A conservative approach will be taken to avoid resampling the same individual
+in a dataset: take the maximum reported N for a given cohort. For the general 
+categories, just sum up all entries as those had no specific designation for 
+cohort and should be independent, except for a few exceptions: 
+Studies 18391951, 18952825, 18391951
+
+To account for GIANT which meta-analyzes 100+ European studies, subtract cohort
+sample sizes in GIANT. I check from Table S1 from 26426971 to see if there
+is overlap in the cohorts from my spreadsheet and take the samples in analysis.
+It seems there is an error in Table S1 with the sample sizes flipped between
+HELIC_MANOLIS and HELIC_POMAK. NTR_NESDA does not have a samples in analysis
+entry, so just took the total sample size.
+
+Figures 2 b and c
+```{r}
+library(ggplot2)
+# GWAS path is a csv file with sample sizes for all ancestries/cohorts for 
+# height studies
+gwas_path <- 'height_gwas_spreadsheet_blank0.csv'
+# Key path is a two column file linking each column name with an ancestry group
+key_path <- 'height_cohort_key.txt'
+# File listing cohorts in GIANT meta-analysis
+giant_key_path <- 'GIANT_key.txt'
+
+height.gwas.df <- read.csv(gwas_path, as.is=T)
+key.df <- read.table(key_path, as.is=T, header=T)
+giant.df <- read.table(giant_key_path, as.is=T, header=T)
+
+# Use GWAS catalog ancestry categories
+ancestry_groups <- c('AAAC','SSA','AFR','EUR','EAS','SEA','CA','SA','ASN',
+                     'AA','OC','GME','HLA','AMR','ADM','OTH','NR')
+anc.count.df <- data.frame(group=ancestry_groups, count=0)
+
+# Check that the column names in the key df
+colnames(height.gwas.df)[!(colnames(height.gwas.df) %in% key.df$Cohort)]
+# Convert Y to 0 (only in row 1)
+replace_cells <- which(height.gwas.df[1, ]=='Y')
+height.gwas.df[1, replace_cells] <- 0
+# Convert columns classified as characters to integer
+for(i in replace_cells) {
+  height.gwas.df[,i] <- as.integer(height.gwas.df[,i])
+}
+# ------------------------------------------------------------------------
+# First naively sum up all entries without taking into account repeated persons
+# Sum general categories
+sum_gen <- colSums(height.gwas.df[, 3:19]) 
+# Sum specific cohorts
+sum_cohorts <- colSums(height.gwas.df[,21:ncol(height.gwas.df)]) 
+# Tally up for each ancestry group
+for(i in ancestry_groups) {
+  anc_cohorts <- key.df$Cohort[key.df$Ancestry==i]
+  anc_index <- which(names(sum_cohorts) %in% anc_cohorts)
+  anc_sum <- sum(sum_cohorts[anc_index])
+  anc.count.df$count[anc.count.df$group==i] <- anc_sum
+}
+
+# Add in the general categories
+for(i in ancestry_groups) {
+  anc_cohorts <- key.df$Cohort[key.df$Ancestry==i]
+  anc_index <- which(names(sum_gen) %in% anc_cohorts)
+  anc_sum <- sum(sum_gen[anc_index])
+  anc.count.df$count[anc.count.df$group==i] <- anc.count.df$count[anc.count.df$group==i] + anc_sum
+}
+# Get proportions
+anc.count.df$proportion <- anc.count.df$count / sum(anc.count.df$count)
+
+## Plot naive height results in pie chart 
+anc.count.df$perc <- anc.count.df$proportion * 100
+eur_prop <- anc.count.df$prop[anc.count.df$group=='EUR']
+pie.df <- data.frame(groups=c('non-European','European'), 
+                     prop=c(1-eur_prop, eur_prop))
+
+ggplot(pie.df, aes(x="", y=prop, fill=groups)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) + theme_void() +
+  scale_fill_manual(values = c('non-European'='#F8766D','European'='#00BFC4')) +
+  theme(legend.position='none')
+
+ggsave('height_ind.pdf')
+
+## Make bar plots
+ggplot(anc.count.df, aes(x=factor(group, level=ancestry_groups), y=perc, 
+                     fill=group)) +
+  geom_bar(stat="identity", width=1) + coord_flip() + 
+  geom_text(aes(label=round(perc, 5)), vjust=0.5, hjust=-0.15, size=3.5) + 
+  scale_fill_manual(values=colors.gwas) + theme_bw() +
+  xlab('Ancestry Category') + ylab('Percentage') + ylim(0,93) +
+  theme(legend.position = "none") 
+
+ggsave('height_ind_all_studies_notindep.pdf')
+# ------------------------------------------------------------------------
+# Take into account repeated persons by taking the maximum in each column
+anc.true.count.df <- data.frame(group=ancestry_groups, count=0)
+max_cohorts <- sapply(height.gwas.df[,21:ncol(height.gwas.df)], max) 
+
+# Account for European GWAS in GIANT by subtracting N from the max_cohort value
+# If GIANT value is greater, then just make the value 0 
+for (i in 1:nrow(giant.df)) {
+  index <- which(names(max_cohorts)==giant.df$Cohort[i])
+  max_cohorts[index] <- max_cohorts[index] - giant.df$N[i]
+  if(max_cohorts[index]<0) {
+    max_cohorts[index] <- 0
+    }
+  }
+
+# Tally up for each ancestry group
+for(i in ancestry_groups) {
+  anc_cohorts <- key.df$Cohort[key.df$Ancestry==i]
+  anc_index <- which(names(max_cohorts) %in% anc_cohorts)
+  anc_sum <- sum(max_cohorts[anc_index])
+  anc.true.count.df$count[anc.true.count.df$group==i] <- anc_sum
+}
+
+# Add in the general categories 
+for(i in ancestry_groups) {
+  anc_cohorts <- key.df$Cohort[key.df$Ancestry==i]
+  anc_index <- which(names(sum_gen) %in% anc_cohorts)
+  anc_sum <- sum(sum_gen[anc_index])
+  anc.true.count.df$count[anc.true.count.df$group==i] <- anc.true.count.df$count[anc.true.count.df$group==i] + anc_sum
+}
+
+# Remove 19053 European to account for study 26366551 (Sardinia) which does not
+# list numbers for European cohorts that are present in other studies at greater
+# numbers. Also remove 29820 European for study 18952825, which uses 18391951 
+# samples as replication. 
+anc.true.count.df$count[anc.true.count.df$group=='EUR'] <- anc.true.count.df$count[anc.true.count.df$group=='EUR'] - 29820 - 19053
+
+# Remove WHI (8149) and BIOME (4301) from African American or Afro Carribean 
+# count since they are included in PAGE_AA.
+anc.true.count.df$count[anc.true.count.df$group=='AAAC'] <- anc.true.count.df$count[anc.true.count.df$group=='AAAC'] - 4301 - 8149
+
+# The PAGE Hispanic and Latin America cohort includes HCHS/SOL, but the number
+# is not clear, so just subtract the HCHS. 
+anc.true.count.df$count[anc.true.count.df$group=='HLA'] <- anc.true.count.df$count[anc.true.count.df$group=='HLA'] - 12595
+
+anc.true.count.df$proportion <- anc.true.count.df$count / sum(anc.true.count.df$count)
+
+## Plot height results in pie chart for Figures 
+eur_prop <- anc.true.count.df$prop[anc.true.count.df$group=='EUR']
+pie.df <- data.frame(groups=c('European','non-European'), 
+                     prop=c(eur_prop, 1-eur_prop))
+
+ggplot(pie.df, aes(x="", y=prop, fill=groups, label=groups)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) + theme_void() +
+  scale_fill_manual(values = c('non-European'='#F8766D','European'='#00BFC4')) +
+  # geom_text(aes(label=groups), vjust=-4.9, size=4) + 
+  # geom_text(aes(label=round(prop, 2)), vjust=-2.6, size=4) +
+  theme(legend.position='none')
+ 
+ggsave('pie_height_ind_independent.pdf')
+
+anc.true.count.df$perc <- anc.true.count.df$proportion * 100
+# Plot full names by linking with abbreviations
+abbr.df <- read.delim('gwas_catalog_key_abbreviations.txt', as.is=T)
+
+fig2.df <- merge(anc.true.count.df, abbr.df, by=1)
+fig2.df <- fig2.df[match(ancestry_groups,fig2.df$group), ]
+# remove Europeans since plotting non-European breakdown
+fig2.df <- fig2.df[fig2.df$group != 'EUR', ]
+
+ggplot(fig2.df, aes(x=factor(sort(group)), y=perc)) +
+  geom_bar(stat="identity", width=1, color='black', size=0.7, alpha=0.5) +
+  coord_flip() + 
+  geom_text(aes(label=round(perc, 2)), vjust=0.5, hjust=-0.15, size=6) + 
+  theme_light(base_size = 22) +
+  xlab('GWAS catalog Ancestry') + ylab('Percentage') + 
+  ylim(0,20)+
+  scale_x_discrete(labels=c(fig2.df$Long.name)) +
+  theme(legend.position = "none") 
+
+ggsave('height_gwas_non-eur_breakdown.pdf', height=7, width=12)
+```
+
+Plot growth of GWAS over time for all phenotypes (stacked area plot). 
+We divide studies/individuals into European or non-Europeans where it is based
+off of whether there is an exact match to "European" in the
+BROAD.ANCESTRAL.CATEGORY column and everything else is non-European. This 
+overestimates the number of non-European studies/individuals since even entries
+such as "European, Other" would be counted as non-European. 
+
+Look at growth of height GWAS studies over time (individual plot), going by
+publication date. 
+
+Figures 1 and Fig 2a
+```{r}
+library(ggplot2)
+library(ggrepel)
+# read ancestry and study data
+ancestries_path <- 'gwas-catalog-v1.0.3-ancestries-r2021-07-08.tsv'
+anc.df <- read.delim(ancestries_path, as.is=T)
+studies_path <- 'gwas-catalog-v1.0.3-studies-r2021-07-08.tsv'
+studies.df <- read.delim(studies_path, as.is=T)
+
+# Remove empty columns
+anc.df <- anc.df[ , 1:12]
+studies.df <- studies.df[ , 1:16]
+merge.df <- merge(anc.df, studies.df, by='STUDY.ACCESSION')
+
+merge.df$DATE.ADDED.TO.CATALOG <- as.Date(merge.df$DATE.ADDED.TO.CATALOG)
+
+## Stratified by ancestry
+merge.df$group <- 'non-European'
+merge.df$group[merge.df$BROAD.ANCESTRAL.CATEGORY=='European'] <- 'European'
+# Divide studies by years
+merge.df$year <- format(as.Date(merge.df$DATE.x), format="%Y")
+years <- names(table(merge.df$year))
+# Make data frame for each year and numbers
+eur.count.df <- data.frame(year=c(0, years), count=0, Group='EUR', cumcount=0,
+                           studycount=0, studycum=0)
+ne.count.df <- data.frame(year=c(0, years), count=0, Group='non-EUR', 
+                          cumcount=0, studycount=0, studycum=0)
+
+# Calculate numbers of participants per year
+for (i in 2:nrow(eur.count.df)) {
+  cur_year <- years[i-1]
+  year.df <- merge.df[merge.df$year==cur_year, ]
+  # Get European counts
+  # participants
+  eur.count.df$count[i] <- sum(year.df$NUMBER.OF.INDIVIDUALS[year.df$group=='European'], na.rm=T)
+  eur.count.df$cumcount[i] <- eur.count.df$cumcount[i-1] + eur.count.df$count[i]
+  # study
+  eur.count.df$studycount[i] <- table(year.df$group)[1]
+  eur.count.df$studycum[i] <- eur.count.df$studycum[i-1] + eur.count.df$studycount[i]
+  # Get non-European counts
+  # participants
+  ne.count.df$count[ne.count.df$year==cur_year] <- sum(year.df$NUMBER.OF.INDIVIDUALS[year.df$group=='non-European'], na.rm=T)
+  ne.count.df$cumcount[i] <- ne.count.df$cumcount[i-1] + ne.count.df$count[i]   
+  # study
+  ne.count.df$studycount[i] <- table(year.df$group)[2]
+  ne.count.df$studycum[i] <- ne.count.df$studycum[i-1] + ne.count.df$studycount[i]
+  
+  rm(cur_year)
+  rm(year.df)
+}
+
+# combine Eur and non-Eur data frames
+year.count.df <- rbind(eur.count.df, ne.count.df)
+year.count.df <- year.count.df[year.count.df$year != 0, ]
+year.count.df$cumcount_mil <- year.count.df$cumcount / 1e6
+year.count.df$Group <- factor(year.count.df$Group, levels=c('non-EUR','EUR'))
+
+## Stacked area plot for individuals non-European vs European (Fig 1a bottom)
+ggplot(year.count.df, aes(x=as.numeric(year), y=cumcount_mil, fill=Group)) + 
+  geom_area(alpha=0.5, colour="black", lwd=1) +
+  theme_classic(base_size = 20) +
+  ylab(expression(atop("Non-unique participants", 
+                       paste("in GWAS (millions)")))) +
+  xlab('Year') + scale_x_continuous(breaks=as.numeric(years)) +
+  theme(axis.text.x = element_text(angle=0),
+        legend.key.size = unit(1.5,'cm'),
+        legend.position = c(.2,.7),
+        legend.title = element_text(size=24),
+        axis.title = element_text(size=25)) 
+ggsave('all_GWAS_stacked_area_individuals.pdf', width = 12)
+
+## Stacked area plot for studies non-European vs European (Fig 1a)
+ggplot(year.count.df, aes(x=as.numeric(year), y=studycum, fill=Group)) + 
+  geom_area(alpha=0.5, colour="black", lwd=1) +
+  theme_classic(base_size = 20) +
+  ylab('GWAS Catalog studies') +
+  xlab('Year') + scale_x_continuous(breaks=as.numeric(years)) +
+  theme(axis.text.x = element_text(angle=0),
+        legend.key.size = unit(1.5,'cm'),
+        legend.position = c(.2,.7),
+        legend.title = element_text(size=24),
+        axis.title = element_text(size=25)) 
+ggsave('all_GWAS_stacked_area_studies.pdf', width = 12, height=4.5)
+
+## Look at how proportion of European changes over time 
+eur.count.df$perc_ind <- NA
+eur.count.df$perc_study <- NA
+for (i in 2:nrow(eur.count.df)) {
+  n_study <- eur.count.df$studycount[i] + ne.count.df$studycount[i]
+  n_ind <- eur.count.df$count[i] + ne.count.df$count[i]
+  eur.count.df$perc_ind[i] <- eur.count.df$count[i] / n_ind * 100 
+  eur.count.df$perc_study[i] <- eur.count.df$studycount[i] / n_study * 100
+  }
+ 
+## Look at distribution of studies per publication 
+t.df <- data.frame(table(merge.df$PUBMED.ID.x))
+# Add year and EUR/non-EUR category
+t.year.df <- merge(t.df, merge.df[,c('year','PUBMED.ID.x','group')], 
+                   by.x=1, by.y=2)
+t.year.uniq.df <- unique(t.year.df)
+eur_pubmed_id <- t.year.uniq.df$Var1[t.year.uniq.df$group=='European']
+ne_pubmed_id <- t.year.uniq.df$Var1[t.year.uniq.df$group=='non-European']
+# For the publication count, if a publication has non-European data and European
+# treat it as non-European (one option), but this might downwardly bias the 
+# European count
+remove_eur <- as.character(eur_pubmed_id[eur_pubmed_id %in% ne_pubmed_id])
+t.year.opt1.df <- t.year.uniq.df[!(t.year.uniq.df$Var1 %in% remove_eur &
+                                   t.year.uniq.df$group=='European'), ]
+# Alternatively, probably better to count it for both non-European and European
+# (use this count for publications since the point is to equalize the weights
+# of number of GWAS phenotypes)
+pb.df <- data.frame(year=years, eur.count=0, ne.count=0)
+# Count the number of publications per year
+for (i in as.numeric(years)) {
+  temp.df <- t.year.uniq.df[t.year.uniq.df$year==i, ]
+  pb.df$eur.count[pb.df$year==i] <- table(temp.df$group)[1]
+  pb.df$ne.count[pb.df$year==i] <- table(temp.df$group)[2]
+  pb.df$perc_pub <- pb.df$eur.count / (pb.df$eur.count + pb.df$ne.count) * 100
+  }
+
+
+## Line plot of percentage European studies and individuals
+# reconfigure data frame for plotting
+perc_ind <- eur.count.df$perc_ind[2:nrow(eur.count.df)]
+perc_study <- eur.count.df$perc_study[2:nrow(eur.count.df)]
+
+ind.df <- data.frame(year=years, perc=perc_ind, Quantity='Individual')
+study.df <- data.frame(year=years, perc=perc_study, Quantity='Study')
+pub.df <- data.frame(year=years, perc=pb.df[,4], Quantity='Publication')
+perc.df <- rbind(ind.df, study.df, pub.df)
+
+# Plot line plots of individuals and studies per year(Fig 1B)
+ggplot(data=perc.df, aes(x=as.numeric(year), y=perc, col=Quantity)) +
+  geom_point(size=4, aes(pch=Quantity), alpha=0.8) + 
+  geom_line(lwd=0.8, alpha=0.15) + 
+  geom_text_repel(aes(label=format(round(perc), nsmall=0)), nudge_y = 2.5,
+            nudge_x=0, show.legend = F, force = 20, min.segment.length = 5) + 
+  theme_classic(base_size = 15) +
+  ylab('Percent') +
+  xlab('Year') + scale_x_continuous(breaks=as.numeric(years)) +
+  theme(axis.text.x = element_text(angle=0),
+        legend.key.size = unit(0.8,'cm'),
+        legend.position = 'bottom',
+        legend.title = element_blank(),
+        legend.text = element_text(size=20),
+        axis.title = element_text(size=25)) + 
+  scale_color_manual(values = c('Individual'='Darkgreen','Study'='Navy',
+                                'Publication'='violetred4'))
+
+ggsave('percent_time_series_ind_study.pdf', width = 8.5, height=5)
+
+## Plot distribution per year 
+# There is very great variance so plotting these distributions is not ideal
+# One paper (33875891) has 3935 studies (all EUR) in 2021, explaining part of 
+# the jump in 2021 for both studies and individuals
+library(ggbreak)
+ggplot(data=t.year.df, aes(year, Freq)) +
+  geom_boxplot() +
+  scale_y_break(c(50,3900))
+
+# scatter plot
+ggplot(data=merge.df, aes(x=DATE.ADDED.TO.CATALOG, y=NUMBER.OF.INDIVIDUALS)) +
+      geom_point(cex=2, alpha=0.35, aes(col=Group)) +
+      theme_classic(base_size=14) + theme(legend.position = 'bottom')
+ggsave('all_time_series_stratified.pdf')
+           
+# Check number of height "studies" 
+traits <- data.frame(table(merge.df$MAPPED_TRAIT))
+# Look at just height
+height.df <- merge.df[merge.df$MAPPED_TRAIT=='body height', ]
+# Seems like there is one study less than from my manual curation
+length(table(height.df$PUBMED.ID.x))
+height.df$DATE.ADDED.TO.CATALOG <- as.Date(height.df$DATE.ADDED.TO.CATALOG)
+
+# Stratify by ancestry
+height.df$group <- 'non-EUR'
+height.df$group[height.df$BROAD.ANCESTRAL.CATEGORY=='European'] <- 'EUR'
+height.df$ind_thousand <- height.df$NUMBER.OF.INDIVIDUALS / 1e3
+height.df$group <- factor(height.df$group, levels=c('non-EUR','EUR'))
+
+# Designate which use UKB and BBJ
+gwas_path <- 'height_gwas_spreadsheet_blank0.csv'
+
+height.gwas.df <- read.csv(gwas_path, as.is=T)
+uk_pubmed <- height.gwas.df$PUBMED.ID[height.gwas.df$UK_Biobank > 0]
+bbj_pubmed <- height.gwas.df$PUBMED.ID[height.gwas.df$BBJ > 0]
+giant_pubmed <- height.gwas.df$PUBMED.ID[height.gwas.df$GIANT > 0]
+# Make everything other (i.e. not UKB,BBJ,GIANT) first
+height.df$cohort <- 'Other'
+height.df$cohort[height.df$PUBMED.ID.x %in% giant_pubmed & height.df$group=='EUR'] <- 'GIANT'
+height.df$cohort[height.df$PUBMED.ID.x %in% uk_pubmed & height.df$group=='EUR'] <- 'UKB'
+
+height.df$cohort[height.df$PUBMED.ID.x %in% bbj_pubmed] <- 'BBJ'
+height.df$cohort <- factor(height.df$cohort,
+                           levels=c('Other','BBJ','UKB','GIANT'))
+
+# GWAS Catalog wrongly reports in Yengo et al. (GCST006901) that the GIANT
+# cohort is other. Should be European, so manually change that designation
+fix_giant_index <- which(height.df$STUDY.ACCESSION=='GCST006901' & 
+                           height.df$cohort=='Other')
+height.df$cohort[fix_giant_index] <- 'GIANT'
+height.df$group[fix_giant_index] <- 'EUR'
+
+## Plot Figure 2a
+ggplot(data=height.df) +
+  geom_point(data=height.df, cex=4, stroke=1, alpha=1,
+             aes(x=as.Date(DATE.x), y=ind_thousand, 
+                           color=group, shape=cohort)) +
+  geom_point(data=height.df, cex=4, alpha=0.7, stroke=1, 
+             aes(x=as.Date(DATE.x), y=ind_thousand,fill=group, shape=cohort),
+             show.legend = F) +
+  theme_bw(base_size=20) +
+  ylab('Individuals (thousands)') +
+  xlab('Date') + 
+  scale_x_date(date_breaks = '2 years', date_labels = '%Y', 
+               breaks=as.numeric(years)) +
+  theme(axis.text.x = element_text(angle=0),
+        legend.key.size = unit(0.6,'cm'),
+        legend.position = c(.25,.7),
+        legend.box.background = element_rect(color='grey', fill='white'),
+        legend.spacing.y = unit(-0.15,'cm'),
+        legend.title = element_blank(),
+        axis.title = element_text(size=25)) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  theme(plot.margin = unit(c(1,1,1,1), "cm")) +
+  scale_shape_manual(values=c(21,23,24,25))  
+
+ggsave('height_time_series_by_anc.pdf', width=7, height=5)
+
+# Distribution of sizes 
+ggplot(data=height.df, aes(x=NUMBER.OF.INDIVIDUALS)) + geom_histogram() +
+  theme_classic(base_size = 14)
+
+# Distribution of studies for each phenotype
+phen.df <- data.frame(table(merge.df$MAPPED_TRAIT))
+ggplot(data=phen.df, aes(x=log10(Freq))) + geom_histogram() +
+  theme_classic(base_size = 14) + xlab('log10(N studies for a trait)')
+ggsave('trait_study_hist.pdf')
+```
+
+NAIVE STATS FOR OVERALL GWAS PARTICIPANTS
+
+Calculate the total number of individuals (i.e. not accounting for resampling)
+in GWAS and the number of studies by broad ancestry group. This is to capture
+naive estimates made in the past. This includes all phenotypes. One issue is 
+that the broad ancestral categories have multiple terms lumped into a unique
+categories. To simplify things, categorize studies with multiple groups as 
+multi-ethnic. For studies with NR and just one other group, I categorize based
+on the reported group. 
+
+I manually categorize the provided labels into the appropriate categories for
+the final counts in a separate spreadsheet. For labels with NR or other and
+an ancestry group, I categorize it as the ancestry group and not multi, because
+typically these unlabelled groups tend to be smaller and so there is perhaps
+a greater loss in information. If there are labels under a broader label (e.g.
+AAAC and SSA, or EAS, SEA and SA, then I label them as AFR and ASN respectively)
+If there is broad label with a specific label of the same general ancestry, then
+go with the broad label.
+
+Note: even though it seems that studies from the same paper repeat the same
+numbers, these are separate phenotypes for a study from the same sample.
+```{r}
+## Read in ancestry file
+ancestries_path <- 'gwas-catalog-v1.0.3-ancestries-r2021-07-08.tsv'
+ancestries_path <- 'ancestries_new.tsv'
+
+anc.df <- read.delim(ancestries_path, as.is=T)
+
+# Get all broad ancestral categories of studies 
+anc_category <- table(anc.df$BROAD.ANCESTRAL.CATEGORY)
+# Write table for manual annotation of ancestry groups
+write.table(data.frame(anc_category)[ ,1], 
+            file = 'gwas_catalog_ancestral_category_raw.txt',
+            quote=F, col.names=F, row.names=F)
+
+# Manually assign labels to GWAS catalog ancestry categories
+anc_key_path <- 'catalog_ancestry_key.txt'
+key.df <- read.delim(anc_key_path, as.is=T, header=T)
+
+# Check that the labels agree across files
+labels_catalog <- table(anc.df$BROAD.ANCESTRAL.CATEGORY)
+disagreements <- which(!(names(labels_catalog) %in% key.df$BROAD.ANCESTRAL.CATEGORY))
+issues <- names(labels_catalog[disagreements])
+
+## Sum up by GWAS catalog ancestral group
+ancestry_groups <- c('AAAC','SSA','AFR','MULTI','MULTI-EUR','EUR','GME','NR',
+                     'EAS','SEA','CA','SA','ASN','AA','OC','HLA','AMR','ADM',
+                     'OTH')
+
+# Check that the abbreviations for ancestry groups match across DF
+key.df$Group[which(!(key.df$Group %in% ancestry_groups))]
+# Create DF to store totals
+total.df <- data.frame(groups=ancestry_groups, N=0)
+
+for(i in ancestry_groups) {
+  # Subset studies by group
+  anc_labels <- key.df$BROAD.ANCESTRAL.CATEGORY[key.df$Group==i]
+  group.df <- anc.df[anc.df$BROAD.ANCESTRAL.CATEGORY %in% anc_labels, ]
+  total.df$N[total.df$groups==i] <- sum(group.df$NUMBER.OF.INDIVIDUALS, na.rm=T)
+  rm(group.df)
+  rm(anc_labels)
+}
+
+total.df$prop <- total.df$N / sum(total.df$N)
+total.df$perc <- total.df$prop * 100
+
+# Make bar plots of participant ancestry breakdown
+library(ggplot2)
+library(ggrepel)
+
+colors.gwas <- c('gold','gold3','gold2','gainsboro','bisque','dodgerblue1',
+                 'cadetblue1','gray','darkolivegreen','chartreuse2','green4',
+                 'darkorchid2','darkolivegreen','deeppink','sienna','red',
+                 'firebrick','darkorange','azure4')
+
+ggplot(total.df, aes(x=factor(groups, level=ancestry_groups), y=perc, 
+                     fill=groups)) +
+  geom_bar(stat="identity", width=1) + coord_flip() + 
+  geom_text(aes(label=round(perc, 5)), vjust=0.5, hjust=-0.15, size=3.5) + 
+  scale_fill_manual(values=colors.gwas) + theme_bw() +
+  xlab('Ancestry Category') + ylab('Percentage') + 
+  ylim(0,92)+
+  theme(legend.position = "none") 
+
+ggsave('gwas_catalog_ind_all_studies.pdf')
+
+# Get diversity in terms of GWAS catalog studies
+study.total.df <- data.frame(groups=ancestry_groups, N=0)
+
+for(i in ancestry_groups) {
+  # Subset studies by group
+  anc_labels <- key.df$BROAD.ANCESTRAL.CATEGORY[key.df$Group==i]
+  study.total.df$N[study.total.df$groups==i] <- table(anc.df$BROAD.ANCESTRAL.CATEGORY %in% anc_labels)[2]
+  rm(anc_labels)
+}
+
+study.total.df$prop <- study.total.df$N / sum(study.total.df$N)
+study.total.df$perc <- study.total.df$prop * 100
+
+# Check through January 2019 to see if proportions match with Sirugo et al.
+anc.df$DATE <- as.Date(anc.df$DATE)
+anc2019.df <- anc.df[anc.df$DATE<'2019-01-01', ]
+
+total2019.df <- data.frame(groups=ancestry_groups, N=0)
+
+for(i in ancestry_groups) {
+  # Subset studies by group
+  anc_labels <- key.df$BROAD.ANCESTRAL.CATEGORY[key.df$Group==i]
+  group.df <- anc2019.df[anc2019.df$BROAD.ANCESTRAL.CATEGORY %in% anc_labels, ]
+  total2019.df$N[total.df$groups==i] <- sum(group.df$NUMBER.OF.INDIVIDUALS, na.rm=T)
+  rm(group.df)
+  rm(anc_labels)
+}
+
+total2019.df$prop <- total2019.df$N / sum(total2019.df$N)
+total2019.df$perc <- total2019.df$prop * 100
+
+ggplot(total2019.df, aes(x=factor(groups, level=ancestry_groups), y=perc, 
+                     fill=groups)) +
+  geom_bar(stat="identity", width=1) + coord_flip() + 
+  geom_text(aes(label=round(perc, 5)), vjust=0.5, hjust=-0.15, size=3.5) + 
+  scale_fill_manual(values=colors.gwas) + theme_bw() +
+  xlab('Ancestry Category') + ylab('Percentage') + 
+  ylim(0,92)+
+  theme(legend.position = "none") 
+
+ggsave('gwas_catalog_jan2019_ind_all_studies.pdf')
+```
+
+For select traits, look at the maximum number of individuals for various 
+ancestry groups. 
+```{r}
+library(ggplot2)
+## Read data
+path <- 'Max_GWAS_size_per_ancestry.txt'
+max.df <- read.delim(path, as.is=T)
+
+traits <- names(table(max.df$Phenotype))
+
+# Abbreviate ancestry names
+rename_path <- 'fig3_abbr_key.txt'
+key.df <- read.delim(rename_path, as.is=T)
+max.df <- merge(max.df, key.df, by.x=2, by.y=2)
+
+# individual lollipop plots
+for (t in traits) {
+  trait.df <- max.df[max.df$Phenotype==t, ]
+  trait.df$n.th <- trait.df$Sample_size / 1000
+  trait.df$Sample_size[trait.df$Sample_size==0] <- NA
+  
+  ggplot(trait.df, aes(x=Short.name, y=n.th, fill=Short.name)) +
+    geom_point(size=4.2) + 
+    geom_segment(aes(x=Short.name, xend=Short.name, y=0, yend=n.th), lwd=1.6) +
+    geom_text(aes(label=round(Sample_size, 5)), size=5, vjust=-1) + 
+    theme_classic(base_size = 24) + #coord_flip() +
+    xlab('Ancestry Category') + ylab('N (thousands)') + 
+    theme(legend.position = "none",
+          plot.margin = unit(c(0.5,1,0.5,0.5),'cm')) +
+    ylim(c(0,(max(trait.df$n.th)+0.17*(max(trait.df$n.th)))))
+  
+  ggsave(paste('max_', t,'.pdf', sep=''), height = 3, width = 8) 
+}
+```
+
+Make map of biobanks in the world. 
+Data from: https://ihccglobal.org
+Downloaded Sep 1, 2021
+```{r}
+library(ggplot2)
+library(rworldmap)
+library(maps)
+library(tidyr)
+library(ggrepel)
+
+cohorts.df <- read.csv('Member_Cohorts.csv', as.is=T)
+
+# Remove cohorts without genetic and phenotypic data
+cohorts.df <- cohorts.df[cohorts.df$Genomic.Data.=='Yes', ]
+cohorts.df <- cohorts.df[cohorts.df$Phenotypic.Data == 'Yes', ]
+
+# Export to manually assign coordinates
+write.table(cohorts.df[ , c(1,3,6,7)],
+            file='ihc_cohorts_genetic.tsv',
+            quote=F, row.names=F, sep='\t')
+
+# Read in file with coordinates
+cohorts.df <- read.delim('ihcc_coordinates_cohorts.txt', as.is=T)
+
+world.df <- map_data('world')
+# get rid of Antarctica
+world.df <- world.df[world.df$lat > -65, ]
+biobank_countries <- names(table(cohorts.df$Regions))
+c = 5
+
+ggplot() + geom_polygon(data = world.df, aes(x=long, y = lat, group = group), 
+                        fill="grey", alpha=0.5) + 
+  theme_void() + 
+  geom_polygon(data = world.df, aes(x = long, y = lat, group=group), 
+                     fill='grey', alpha=0.3, color = "white", lwd=0.5) +
+  geom_polygon(data = world.df[world.df$region %in% biobank_countries, ], 
+               aes(x = long, y = lat, group=group), 
+               fill='wheat', alpha=0.9, color = "white") +
+  geom_point(data=cohorts.df, 
+         aes(x=longitude, y=latitude, size=Target.Enrollment), 
+         alpha=1, color='black', shape=1) +
+  geom_point(data=cohorts.df, 
+           aes(x=longitude, y=latitude, size=Enrolled, 
+               label=Cohort.Name), 
+           alpha=0.4, color='red', shape=16) +
+  geom_text_repel(data=cohorts.df, force=10, segment.alpha = 0.3, 
+             aes(x=longitude, y=latitude, label=short.name)) + 
+  theme(legend.position = 'None') 
+
+ggsave('ihcc_map.pdf', width = 2.05458*c, height = c)
+```
+
+
